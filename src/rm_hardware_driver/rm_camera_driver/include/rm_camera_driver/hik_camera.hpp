@@ -26,7 +26,9 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 // std
+#include <atomic>
 #include <memory>
+#include <mutex>
 // project
 #include "rm_camera_driver/recorder.hpp"
 #include "rm_utils/heartbeat.hpp"
@@ -40,9 +42,16 @@ public:
   ~HikCameraNode() override;
 
 private:
+  // Try to enumerate and open the camera, then start grabbing.
+  // Returns true on success. Safe to call repeatedly (no-op if already open).
+  bool openDevice();
+  // Stop grabbing and release the camera handle. Safe to call when not open.
+  void closeDevice();
+
   void declareParameters();
+  void applyParameters();
   void timerCallback();
-  
+
   rcl_interfaces::msg::SetParametersResult parametersCallback(
     const std::vector<rclcpp::Parameter> & parameters);
 
@@ -52,16 +61,22 @@ private:
   image_transport::CameraPublisher camera_pub_;
   std::unique_ptr<Recorder> recorder_;
 
-  int nRet = MV_OK;
   void * camera_handle_ = nullptr;
-  MV_IMAGE_BASIC_INFO img_info_;
   MV_CC_PIXEL_CONVERT_PARAM convert_param_;
 
+  std::string camera_sn_;
   std::string camera_name_;
   std::string camera_info_url_;
   std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
 
-  int fail_count_ = 0;
+  // Protects camera_handle_ and all MVS SDK calls (SDK is NOT thread-safe)
+  std::mutex camera_mutex_;
+  std::atomic<bool> device_open_{false};
+  std::atomic<int> fail_count_{0};
+  // Nanoseconds timestamp of the last received frame (RCL_ROS_TIME epoch).
+  // Updated by the capture thread, read by the watchdog timer.
+  std::atomic<int64_t> last_frame_time_ns_{0};
+
   std::thread capture_thread_;
   rclcpp::TimerBase::SharedPtr timer_;
 

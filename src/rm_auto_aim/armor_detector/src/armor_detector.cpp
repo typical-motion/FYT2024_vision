@@ -34,6 +34,8 @@
 #include "rm_utils/common.hpp"
 
 #include "fmt/core.h"
+#include "fmt/format.h"
+
 namespace fyt::auto_aim {
 Detector::Detector(const int &bin_thres,
                    const EnemyColor &color,
