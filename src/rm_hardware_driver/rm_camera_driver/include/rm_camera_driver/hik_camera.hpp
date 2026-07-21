@@ -76,6 +76,8 @@ private:
   // Nanoseconds timestamp of the last received frame (RCL_ROS_TIME epoch).
   // Updated by the capture thread, read by the watchdog timer.
   std::atomic<int64_t> last_frame_time_ns_{0};
+  // Set by the watchdog timer to request the capture thread to close + reopen.
+  std::atomic<bool> need_reopen_{false};
 
   std::thread capture_thread_;
   rclcpp::TimerBase::SharedPtr timer_;

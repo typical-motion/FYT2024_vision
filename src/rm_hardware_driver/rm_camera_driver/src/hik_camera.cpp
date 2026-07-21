@@ -70,22 +70,32 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
   // the device asynchronously, so a missing camera won't stall bringup.
   capture_thread_ = std::thread{[this]() -> void {
     MV_FRAME_OUT out_frame;
-    memset(&out_frame, 0, sizeof(out_frame));
 
     while (rclcpp::ok()) {
+      // The watchdog timer may request a full reopen via this flag.
+      // closeDevice() / openDevice() are called from THIS thread so that
+      // MV_CC_StopGrabbing, MV_CC_CloseDevice, etc. never race with
+      // MV_CC_GetImageBuffer (MVS SDK is NOT thread-safe across those calls).
+      if (need_reopen_.load()) {
+        FYT_INFO("camera_driver", "Capture thread handling reopen request...");
+        closeDevice();
+        openDevice();
+        need_reopen_ = false;
+        continue;
+      }
+
       if (!device_open_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
       }
 
+      memset(&out_frame, 0, sizeof(out_frame));
       int ret;
       {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         ret = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
         // IMPORTANT: Never call FreeImageBuffer when GetImageBuffer fails —
-        // the frame was never acquired and the pointer is garbage. Doing so
-        // corrupts the SDK's internal buffer pool, causing the camera to
-        // "freeze" after a few timeouts.
+        // the frame was never acquired and the pointer is garbage.
       }
 
       if (ret == MV_OK) {
@@ -124,10 +134,9 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
           FYT_WARN("camera_driver", "Convert pixel failed! nRet: [{:#x}]", convert_ret);
         }
       } else {
-        // MV_E_NODATA is a simple timeout — no frame arrived within 1000 ms.
-        // This is normal during long exposures or brief USB hiccups.
-        // Reset the fail counter so the watchdog does not trigger a spurious reopen.
         if (ret == static_cast<int>(MV_E_NODATA)) {
+          // MV_E_NODATA is a simple timeout — no frame within 1000 ms.
+          // Reset the counter; this is normal during long exposures.
           fail_count_ = 0;
         } else {
           fail_count_++;
@@ -288,25 +297,18 @@ void HikCameraNode::timerCallback()
     return;
   }
 
-  // Check the physical link first; a disconnected USB camera must be fully
-  // re-enumerated, RestartGrabbing alone can never recover from that.
-  bool connected = false;
-  {
-    std::lock_guard<std::mutex> lock(camera_mutex_);
-    connected = MV_CC_IsDeviceConnected(camera_handle_);
-  }
-  if (!connected) {
-    FYT_WARN("camera_driver", "Camera disconnected! Reopening...");
-    closeDevice();
-    return;
-  }
-
-  // Frame watchdog: no frame for too long -> full reopen
+  // Frame watchdog: no frame for too long -> ask capture thread to reopen.
+  // We do NOT call closeDevice() directly from this timer because:
+  //   1. MV_CC_StopGrabbing must be called from the SAME thread as
+  //      MV_CC_GetImageBuffer (MVS SDK explicitly forbids cross-thread
+  //      call pairs).
+  //   2. MV_CC_IsDeviceConnected can hang permanently during USB streaming.
+  // Instead we just flip need_reopen_; the capture thread handles the rest.
   const int64_t last_ns = last_frame_time_ns_.load();
   const double dt = (this->now().nanoseconds() - last_ns) / 1e9;
   if (last_ns != 0 && dt > 5.0) {
     FYT_WARN("camera_driver", "Camera is not alive! lost frame for {:.2f} seconds", dt);
-    closeDevice();
+    need_reopen_ = true;
   }
 }
 
