@@ -397,6 +397,14 @@ rcl_interfaces::msg::SetParametersResult HikCameraNode::parametersCallback(
         result.successful = false;
         result.reason = "Failed to set gain, status = " + std::to_string(status);
       }
+    } else if (
+      param.get_name() == "recording" ||
+      param.get_name() == "frame_rate" ||
+      param.get_name() == "camera_info_url" ||
+      param.get_name() == "camera_name" ||
+      param.get_name() == "use_sensor_data_qos" ||
+      param.get_name() == "camera_sn") {
+      // These parameters are only used at startup / reopen; accept silently.
     } else {
       result.successful = false;
       result.reason = "Unknown parameter: " + param.get_name();
