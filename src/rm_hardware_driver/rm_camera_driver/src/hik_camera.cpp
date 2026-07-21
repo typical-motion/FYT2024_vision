@@ -82,9 +82,10 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
       {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         ret = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
-        if (ret != MV_OK) {
-          MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
-        }
+        // IMPORTANT: Never call FreeImageBuffer when GetImageBuffer fails —
+        // the frame was never acquired and the pointer is garbage. Doing so
+        // corrupts the SDK's internal buffer pool, causing the camera to
+        // "freeze" after a few timeouts.
       }
 
       if (ret == MV_OK) {
@@ -123,13 +124,17 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
           FYT_WARN("camera_driver", "Convert pixel failed! nRet: [{:#x}]", convert_ret);
         }
       } else {
-        // Timeout while waiting for a frame. This happens during exposure
-        // changes as well as on real disconnects, so just count it; the
-        // watchdog timer decides when to reopen the device.
-        fail_count_++;
-        RCLCPP_WARN_THROTTLE(
-          this->get_logger(), *this->get_clock(), 3000,
-          "Get buffer failed! nRet: [%#x], fail count: %d", ret, fail_count_.load());
+        // MV_E_NODATA is a simple timeout — no frame arrived within 1000 ms.
+        // This is normal during long exposures or brief USB hiccups.
+        // Reset the fail counter so the watchdog does not trigger a spurious reopen.
+        if (ret == static_cast<int>(MV_E_NODATA)) {
+          fail_count_ = 0;
+        } else {
+          fail_count_++;
+          RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 3000,
+            "Get buffer failed! nRet: [%#x], fail count: %d", ret, fail_count_.load());
+        }
       }
     }
   }};
