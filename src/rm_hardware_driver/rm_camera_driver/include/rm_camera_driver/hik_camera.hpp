@@ -46,7 +46,9 @@ private:
   // Returns true on success. Safe to call repeatedly (no-op if already open).
   bool openDevice();
   // Stop grabbing and release the camera handle. Safe to call when not open.
-  void closeDevice();
+  // If force=true, skips MV_CC_StopGrabbing (which hangs on a dead device)
+  // and only calls CloseDevice + DestroyHandle.
+  void closeDevice(bool force = false);
 
   void declareParameters();
   void applyParameters();
@@ -76,6 +78,8 @@ private:
   // Nanoseconds timestamp of the last received frame (RCL_ROS_TIME epoch).
   // Updated by the capture thread, read by the watchdog timer.
   std::atomic<int64_t> last_frame_time_ns_{0};
+  // Set by the watchdog timer to request the capture thread to close + reopen.
+  std::atomic<bool> need_reopen_{false};
 
   std::thread capture_thread_;
   rclcpp::TimerBase::SharedPtr timer_;

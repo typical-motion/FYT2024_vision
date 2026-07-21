@@ -73,6 +73,17 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
     memset(&out_frame, 0, sizeof(out_frame));
 
     while (rclcpp::ok()) {
+      // The watchdog timer requests a close+reopen via this flag.
+      // We handle it HERE (capture thread) so that MV_CC_StopGrabbing etc.
+      // never race with MV_CC_GetImageBuffer across threads.
+      if (need_reopen_.load()) {
+        FYT_INFO("camera_driver", "Capture thread handling reopen request...");
+        closeDevice(/*force=*/true);
+        openDevice();
+        need_reopen_ = false;
+        continue;
+      }
+
       if (!device_open_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
@@ -82,9 +93,9 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
       {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         ret = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
-        if (ret != MV_OK) {
-          MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
-        }
+        // CRITICAL: never call FreeImageBuffer when GetImageBuffer fails.
+        // out_frame contains garbage — freeing it corrupts the SDK buffer
+        // pool and eventually causes GetImageBuffer to block for seconds.
       }
 
       if (ret == MV_OK) {
@@ -123,13 +134,14 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
           FYT_WARN("camera_driver", "Convert pixel failed! nRet: [{:#x}]", convert_ret);
         }
       } else {
-        // Timeout while waiting for a frame. This happens during exposure
-        // changes as well as on real disconnects, so just count it; the
-        // watchdog timer decides when to reopen the device.
-        fail_count_++;
-        RCLCPP_WARN_THROTTLE(
-          this->get_logger(), *this->get_clock(), 3000,
-          "Get buffer failed! nRet: [%#x], fail count: %d", ret, fail_count_.load());
+        // MV_E_NODATA is a normal timeout — no frame within 1000 ms.
+        // Do NOT count it; USB hiccups / long exposures are routine.
+        if (ret != static_cast<int>(MV_E_NODATA)) {
+          fail_count_++;
+          RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 3000,
+            "Get buffer failed! nRet: [%#x], fail count: %d", ret, fail_count_.load());
+        }
       }
     }
   }};
@@ -256,7 +268,7 @@ bool HikCameraNode::openDevice()
   return true;
 }
 
-void HikCameraNode::closeDevice()
+void HikCameraNode::closeDevice(bool force)
 {
   std::lock_guard<std::mutex> lock(camera_mutex_);
 
@@ -267,7 +279,13 @@ void HikCameraNode::closeDevice()
     FYT_INFO("camera_driver", "Recorder stopped!");
   }
   if (camera_handle_ != nullptr) {
-    MV_CC_StopGrabbing(camera_handle_);
+    // MV_CC_StopGrabbing hangs indefinitely on a dead USB device
+    // because the SDK tries to communicate with hardware that is gone.
+    // When force=true (watchdog-triggered reconnect) we skip it and go
+    // straight to CloseDevice, which handles a dead device gracefully.
+    if (!force) {
+      MV_CC_StopGrabbing(camera_handle_);
+    }
     MV_CC_CloseDevice(camera_handle_);
     MV_CC_DestroyHandle(&camera_handle_);
     camera_handle_ = nullptr;
@@ -283,25 +301,16 @@ void HikCameraNode::timerCallback()
     return;
   }
 
-  // Check the physical link first; a disconnected USB camera must be fully
-  // re-enumerated, RestartGrabbing alone can never recover from that.
-  bool connected = false;
-  {
-    std::lock_guard<std::mutex> lock(camera_mutex_);
-    connected = MV_CC_IsDeviceConnected(camera_handle_);
-  }
-  if (!connected) {
-    FYT_WARN("camera_driver", "Camera disconnected! Reopening...");
-    closeDevice();
-    return;
-  }
-
-  // Frame watchdog: no frame for too long -> full reopen
+  // Frame watchdog: no frame for too long -> ask capture thread to reopen.
+  // We must NOT call closeDevice() / MV_CC_StopGrabbing from this timer
+  // because MVS SDK forbids cross-thread StopGrabbing+GetImageBuffer pairs.
+  // We also must NOT call MV_CC_IsDeviceConnected here — it can hang
+  // indefinitely during USB streaming, freezing the entire executor.
   const int64_t last_ns = last_frame_time_ns_.load();
   const double dt = (this->now().nanoseconds() - last_ns) / 1e9;
   if (last_ns != 0 && dt > 5.0) {
     FYT_WARN("camera_driver", "Camera is not alive! lost frame for {:.2f} seconds", dt);
-    closeDevice();
+    need_reopen_ = true;
   }
 }
 
