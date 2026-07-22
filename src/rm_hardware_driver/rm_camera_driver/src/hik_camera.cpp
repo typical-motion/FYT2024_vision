@@ -389,7 +389,7 @@ void HikCameraNode::declareParameters()
 
   // Exposure time
   param_desc.description = "Exposure time in microseconds";
-  param_desc.integer_range[0].from_value = 1;
+  param_desc.integer_range[0].from_value = 15;
   param_desc.integer_range[0].to_value = 200000;
   int exposure_time = this->declare_parameter("exposure_time", 5000, param_desc);
   FYT_INFO("camera_driver", "Exposure time: {}", exposure_time);
