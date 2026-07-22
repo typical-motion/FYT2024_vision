@@ -68,17 +68,20 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
 
   // NOTE: the constructor never blocks on camera enumeration. The timer opens
   // the device asynchronously, so a missing camera won't stall bringup.
+  //
+  // Capture thread: grabs raw frames from SDK and immediately returns buffers
+  // to the SDK pool (within ~1 ms).  Convert + publish are offloaded to the
+  // convert thread so that buffer-pool exhaustion can never happen.
   capture_thread_ = std::thread{[this]() -> void {
     MV_FRAME_OUT out_frame;
-    memset(&out_frame, 0, sizeof(out_frame));
 
     while (rclcpp::ok()) {
-      // The watchdog timer requests a close+reopen via this flag.
-      // We handle it HERE (capture thread) so that MV_CC_StopGrabbing etc.
-      // never race with MV_CC_GetImageBuffer across threads.
+      // -------- reopen path (only executed by the capture thread) --------
       if (need_reopen_.load()) {
         FYT_INFO("camera_driver", "Capture thread handling reopen request...");
         closeDevice(/*force=*/true);
+        // Give the USB stack a moment to settle after the forced close.
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         openDevice();
         need_reopen_ = false;
         continue;
@@ -89,53 +92,38 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
         continue;
       }
 
+      memset(&out_frame, 0, sizeof(out_frame));
       int ret;
       {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         ret = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
-        // CRITICAL: never call FreeImageBuffer when GetImageBuffer fails.
-        // out_frame contains garbage — freeing it corrupts the SDK buffer
-        // pool and eventually causes GetImageBuffer to block for seconds.
       }
 
       if (ret == MV_OK) {
-        image_msg_.header.stamp = this->now();
-        image_msg_.height = out_frame.stFrameInfo.nHeight;
-        image_msg_.width = out_frame.stFrameInfo.nWidth;
-        image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
-        image_msg_.data.resize(
-          static_cast<size_t>(image_msg_.width) * image_msg_.height * 3);
+        const auto stamp = this->now();
 
-        convert_param_.nWidth = out_frame.stFrameInfo.nWidth;
-        convert_param_.nHeight = out_frame.stFrameInfo.nHeight;
-        convert_param_.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
-        convert_param_.pDstBuffer = image_msg_.data.data();
-        convert_param_.nDstBufferSize = image_msg_.data.size();
-        convert_param_.pSrcData = out_frame.pBufAddr;
-        convert_param_.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
-        convert_param_.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
+        // Copy the raw payload out of the SDK buffer, then free it back
+        // to the pool *immediately* — well before conversion & publishing.
+        RawFrame raw;
+        raw.copyFrom(out_frame);
+        raw.stamp = stamp;
 
-        int convert_ret;
         {
           std::lock_guard<std::mutex> lock(camera_mutex_);
-          convert_ret = MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
           MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
         }
 
-        if (convert_ret == MV_OK) {
-          camera_info_msg_.header = image_msg_.header;
-          camera_pub_.publish(image_msg_, camera_info_msg_);
-          if (recorder_ != nullptr) {
-            recorder_->addFrame(image_msg_.data);
+        // Hand off to the convert thread.
+        {
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          if (frame_queue_.size() < 4) {  // drop oldest frames, not newest
+            frame_queue_.push(std::move(raw));
           }
-          last_frame_time_ns_.store(rclcpp::Time(image_msg_.header.stamp).nanoseconds());
-          fail_count_ = 0;
-        } else {
-          FYT_WARN("camera_driver", "Convert pixel failed! nRet: [{:#x}]", convert_ret);
         }
+        queue_cv_.notify_one();
+
+        fail_count_ = 0;
       } else {
-        // MV_E_NODATA is a normal timeout — no frame within 1000 ms.
-        // Do NOT count it; USB hiccups / long exposures are routine.
         if (ret != static_cast<int>(MV_E_NODATA)) {
           fail_count_++;
           RCLCPP_WARN_THROTTLE(
@@ -145,10 +133,23 @@ HikCameraNode::HikCameraNode(const rclcpp::NodeOptions & options)
       }
     }
   }};
+
+  // Convert thread: pixel conversion + ROS publish.
+  convert_running_ = true;
+  convert_thread_ = std::thread{&HikCameraNode::convertThreadLoop, this};
 }
 
 HikCameraNode::~HikCameraNode()
 {
+  // Stop convert thread first so it won't try to use camera_handle_ while
+  // closeDevice() tears everything down.
+  if (convert_running_) {
+    convert_running_ = false;
+    queue_cv_.notify_all();
+  }
+  if (convert_thread_.joinable()) {
+    convert_thread_.join();
+  }
   if (capture_thread_.joinable()) {
     capture_thread_.join();
   }
@@ -279,16 +280,19 @@ void HikCameraNode::closeDevice(bool force)
     FYT_INFO("camera_driver", "Recorder stopped!");
   }
   if (camera_handle_ != nullptr) {
-    // MV_CC_StopGrabbing hangs indefinitely on a dead USB device
-    // because the SDK tries to communicate with hardware that is gone.
-    // When force=true (watchdog-triggered reconnect) we skip it and go
-    // straight to CloseDevice, which handles a dead device gracefully.
-    if (!force) {
+    if (force) {
+      // Skip both StopGrabbing and CloseDevice when the USB link is
+      // suspected dead — either call can hang indefinitely as the SDK
+      // tries to communicate with absent hardware.  DestroyHandle
+      // performs an internal teardown that does not touch the hardware.
+      MV_CC_DestroyHandle(&camera_handle_);
+      camera_handle_ = nullptr;
+    } else {
       MV_CC_StopGrabbing(camera_handle_);
+      MV_CC_CloseDevice(camera_handle_);
+      MV_CC_DestroyHandle(&camera_handle_);
+      camera_handle_ = nullptr;
     }
-    MV_CC_CloseDevice(camera_handle_);
-    MV_CC_DestroyHandle(&camera_handle_);
-    camera_handle_ = nullptr;
   }
   fail_count_ = 0;
 }
@@ -311,6 +315,60 @@ void HikCameraNode::timerCallback()
   if (last_ns != 0 && dt > 5.0) {
     FYT_WARN("camera_driver", "Camera is not alive! lost frame for {:.2f} seconds", dt);
     need_reopen_ = true;
+  }
+}
+
+void HikCameraNode::convertThreadLoop()
+{
+  MV_CC_PIXEL_CONVERT_PARAM local_convert_param;
+  memset(&local_convert_param, 0, sizeof(local_convert_param));
+
+  while (convert_running_) {
+    RawFrame raw;
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      queue_cv_.wait(lock, [this] {
+        return !frame_queue_.empty() || !convert_running_;
+      });
+      if (!convert_running_) break;
+      raw = std::move(frame_queue_.front());
+      frame_queue_.pop();
+    }
+
+    if (!device_open_.load()) continue;
+
+    // Pixel conversion
+    image_msg_.header.stamp = raw.stamp;
+    image_msg_.height = raw.height;
+    image_msg_.width = raw.width;
+    image_msg_.step = raw.width * 3;
+    image_msg_.data.resize(static_cast<size_t>(raw.width) * raw.height * 3);
+
+    local_convert_param.nWidth = raw.width;
+    local_convert_param.nHeight = raw.height;
+    local_convert_param.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
+    local_convert_param.pDstBuffer = image_msg_.data.data();
+    local_convert_param.nDstBufferSize = image_msg_.data.size();
+    local_convert_param.pSrcData = raw.data.data();
+    local_convert_param.nSrcDataLen = raw.frameLen;
+    local_convert_param.enSrcPixelType = raw.srcPixelType;
+
+    int convert_ret;
+    {
+      std::lock_guard<std::mutex> lock(camera_mutex_);
+      convert_ret = MV_CC_ConvertPixelType(camera_handle_, &local_convert_param);
+    }
+
+    if (convert_ret == MV_OK) {
+      camera_info_msg_.header = image_msg_.header;
+      camera_pub_.publish(image_msg_, camera_info_msg_);
+      if (recorder_ != nullptr) {
+        recorder_->addFrame(image_msg_.data);
+      }
+      last_frame_time_ns_.store(rclcpp::Time(image_msg_.header.stamp).nanoseconds());
+    } else {
+      FYT_WARN("camera_driver", "Convert pixel failed! nRet: [{:#x}]", convert_ret);
+    }
   }
 }
 

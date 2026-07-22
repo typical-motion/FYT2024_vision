@@ -27,13 +27,40 @@
 #include <sensor_msgs/msg/image.hpp>
 // std
 #include <atomic>
+#include <condition_variable>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
 // project
 #include "rm_camera_driver/recorder.hpp"
 #include "rm_utils/heartbeat.hpp"
 
 namespace fyt::camera_driver {
+
+/// Raw frame payload passed from capture thread to convert thread.
+/// The capture thread copies the SDK buffer here and frees it immediately
+/// to keep the SDK buffer pool from being exhausted.
+struct RawFrame {
+  std::vector<uint8_t> data;
+  unsigned int width = 0;
+  unsigned int height = 0;
+  MvGvspPixelType srcPixelType = PixelType_Gvsp_Undefined;
+  unsigned int frameLen = 0;
+  rclcpp::Time stamp;
+
+  void copyFrom(const MV_FRAME_OUT & out) {
+    width = out.stFrameInfo.nWidth;
+    height = out.stFrameInfo.nHeight;
+    srcPixelType = out.stFrameInfo.enPixelType;
+    frameLen = out.stFrameInfo.nFrameLen;
+    const size_t sz = frameLen;
+    data.resize(sz);
+    std::memcpy(data.data(), out.pBufAddr, sz);
+  }
+};
 
 class HikCameraNode : public rclcpp::Node
 {
@@ -53,6 +80,7 @@ private:
   void declareParameters();
   void applyParameters();
   void timerCallback();
+  void convertThreadLoop();
 
   rcl_interfaces::msg::SetParametersResult parametersCallback(
     const std::vector<rclcpp::Parameter> & parameters);
@@ -82,7 +110,14 @@ private:
   std::atomic<bool> need_reopen_{false};
 
   std::thread capture_thread_;
+  std::thread convert_thread_;
   rclcpp::TimerBase::SharedPtr timer_;
+
+  // Frame queue: capture → convert
+  std::queue<RawFrame> frame_queue_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::atomic<bool> convert_running_{false};
 
   // Heartbeat
   HeartBeatPublisher::SharedPtr heartbeat_;
